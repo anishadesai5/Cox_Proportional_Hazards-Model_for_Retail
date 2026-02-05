@@ -1,0 +1,2 @@
+Total Records,Products Analyzed,Train Size,Test Size,Model Type,Train C-index,Test C-index,Improvement vs Non-Stratified
+729256,10,20857,5215,Stratified Cox PH,0.7811085784284909,0.7824103648391438,43.26%
