@@ -74,13 +74,19 @@ def clean_data(df):
     # 3. Remove negative quantities and prices
     df = df[(df['Quantity'] > 0) & (df['Price'] > 0)].copy()
     
-    # 4. Convert InvoiceDate to datetime
+    # 4. Remove duplicates (EDA showed 3.22% duplicates)
+    df = df.drop_duplicates()
+
+    # 5. Convert InvoiceDate to datetime
     df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'])
-    
-    # 5. Create total revenue column
+
+    # 6. Create total revenue column
     df['Revenue'] = df['Quantity'] * df['Price']
-    
-    # 6. Rename columns for convenience
+
+    # 7. Ensure StockCode is string type
+    df['StockCode'] = df['StockCode'].astype(str)
+
+    # 8. Rename columns for convenience
     df = df.rename(columns={
         'Invoice': 'InvoiceNo',
         'StockCode': 'StockCode',
@@ -322,10 +328,16 @@ def train_stratified_cox_model(survival_df, top_n_products=20):
     print("="*60)
     
     train_concordance_strat = cph_stratified.concordance_index_
-    test_concordance_strat = cph_stratified.score(test_df[feature_cols + ['DURATION_DAYS', 'EVENT', 'StockCode']])
-    
+    test_concordance_strat = cph_stratified.score(
+        test_df[feature_cols + ['DURATION_DAYS', 'EVENT', 'StockCode']],
+        scoring_method='concordance_index'
+    )
+
     train_concordance_unstrat = cph_unstratified.concordance_index_
-    test_concordance_unstrat = cph_unstratified.score(test_df[feature_cols + ['DURATION_DAYS', 'EVENT']])
+    test_concordance_unstrat = cph_unstratified.score(
+        test_df[feature_cols + ['DURATION_DAYS', 'EVENT']],
+        scoring_method='concordance_index'
+    )
     
     print(f"\nSTRATIFIED MODEL:")
     print(f"  Train Concordance: {train_concordance_strat:.4f}")
@@ -348,56 +360,76 @@ def train_stratified_cox_model(survival_df, top_n_products=20):
 def predict_repurchase_risk(model, test_df, feature_cols, top_n_customers=10):
     """
     For each product, rank customers by repurchase likelihood
-    
+
     Uses partial hazard (risk score) to rank customers
     Higher risk = More likely to repurchase soon
     """
-    
+
     print("\n🎲 PREDICTING REPURCHASE RISK FOR EACH PRODUCT...")
     print("="*60)
-    
+
+    # Get baseline survival - handle tuple column names for stratified models
+    baseline_survival = model.baseline_survival_
+    print(f"\nBaseline survival columns type: {type(baseline_survival.columns[0])}")
+
+    # Convert to dict for easier lookup
+    if isinstance(baseline_survival.columns[0], tuple):
+        baseline_dict = {col[0]: baseline_survival[col] for col in baseline_survival.columns}
+        print("Note: Baseline columns are tuples, extracting first element")
+    else:
+        baseline_dict = {str(col): baseline_survival[col] for col in baseline_survival.columns}
+
     results = []
-    
+
     # Get unique products in test set
     products = test_df['StockCode'].unique()[:5]  # Top 5 for demo
-    
+
     for product in products:
         print(f"\n📦 Product: {product}")
         print("-" * 40)
-        
+
+        product_str = str(product)
+
         # Get customers who purchased this product
-        product_df = test_df[test_df['StockCode'] == product].copy()
-        
+        product_df = test_df[test_df['StockCode'] == product_str].copy()
+
         if len(product_df) == 0:
+            print("   No test data for this product")
             continue
-        
-        # Predict partial hazard (risk score) for each customer
-        risk_scores = model.predict_partial_hazard(product_df[feature_cols])
-        product_df['RISK_SCORE'] = risk_scores.values
-        
-        # Predict survival probability at multiple time horizons
-        survival_func = model.predict_survival_function(product_df[feature_cols])
-        
-        # Calculate probability of repurchase within 30, 60, 90 days
-        if 30 in survival_func.index:
-            product_df['PROB_30D'] = 1 - survival_func.loc[30].values
-        if 60 in survival_func.index:
-            product_df['PROB_60D'] = 1 - survival_func.loc[60].values
-        if 90 in survival_func.index:
-            product_df['PROB_90D'] = 1 - survival_func.loc[90].values
-        
+
+        # Check if baseline exists for this product
+        if product_str not in baseline_dict:
+            print(f"   Warning: No baseline survival for product {product_str}")
+            continue
+
+        # Predict partial hazard (risk score) for each customer - exp(X*beta)
+        partial_hazard = model.predict_partial_hazard(product_df[feature_cols])
+        product_df['RISK_SCORE'] = partial_hazard.values
+
+        # Get baseline survival for this product
+        baseline_surv = baseline_dict[product_str]
+
+        # Calculate survival probabilities: S(t|X) = S_0(t)^exp(X*beta)
+        for horizon in [30, 60, 90]:
+            valid_times = baseline_surv.index[baseline_surv.index <= horizon]
+            closest_time = valid_times.max() if len(valid_times) > 0 else baseline_surv.index.min()
+
+            base_surv_at_t = baseline_surv.loc[closest_time]
+            survival_probs = base_surv_at_t ** partial_hazard.values
+            product_df[f'PROB_{horizon}D'] = 1 - survival_probs
+
         # Sort by risk score (highest first)
         product_df = product_df.sort_values('RISK_SCORE', ascending=False)
-        
+
         # Display top N customers
         print(f"\n🏆 Top {min(top_n_customers, len(product_df))} customers most likely to repurchase:")
-        
-        display_cols = ['CustomerID', 'RISK_SCORE', 'PROB_30D', 'PROB_60D', 'PROB_90D', 
+
+        display_cols = ['CustomerID', 'RISK_SCORE', 'PROB_30D', 'PROB_60D', 'PROB_90D',
                        'FREQUENCY', 'PRODUCT_FREQUENCY', 'EVENT']
-        
-        if all(col in product_df.columns for col in ['PROB_30D', 'PROB_60D', 'PROB_90D']):
-            print(product_df[display_cols].head(top_n_customers).to_string(index=False))
-        
+
+        available_cols = [c for c in display_cols if c in product_df.columns]
+        print(product_df[available_cols].head(top_n_customers).to_string(index=False))
+
         # Store results
         for _, row in product_df.head(top_n_customers).iterrows():
             results.append({
@@ -409,9 +441,9 @@ def predict_repurchase_risk(model, test_df, feature_cols, top_n_customers=10):
                 'PROB_90D': row.get('PROB_90D', np.nan),
                 'Actual_Event': row['EVENT']
             })
-    
+
     results_df = pd.DataFrame(results)
-    
+
     return results_df
 
 
@@ -419,56 +451,70 @@ def visualize_predictions(model, test_df, feature_cols, product_code):
     """
     Visualize survival curves for a specific product
     """
-    
+
     print(f"\n📈 VISUALIZING PREDICTIONS FOR PRODUCT: {product_code}")
     print("="*60)
-    
-    product_df = test_df[test_df['StockCode'] == product_code].copy()
-    
+
+    product_str = str(product_code)
+    product_df = test_df[test_df['StockCode'] == product_str].copy()
+
     if len(product_df) == 0:
         print(f"No test data for product {product_code}")
         return
-    
+
+    # Get baseline survival for this product
+    baseline_survival = model.baseline_survival_
+    if isinstance(baseline_survival.columns[0], tuple):
+        baseline_dict = {col[0]: baseline_survival[col] for col in baseline_survival.columns}
+    else:
+        baseline_dict = {str(col): baseline_survival[col] for col in baseline_survival.columns}
+
+    if product_str not in baseline_dict:
+        print(f"No baseline survival for product {product_code}")
+        return
+
+    baseline_surv = baseline_dict[product_str]
+
     # Get top 5 highest and lowest risk customers
-    risk_scores = model.predict_partial_hazard(product_df[feature_cols])
-    product_df['RISK_SCORE'] = risk_scores.values
-    
+    partial_hazard = model.predict_partial_hazard(product_df[feature_cols])
+    product_df['RISK_SCORE'] = partial_hazard.values
+
     top_5 = product_df.nlargest(5, 'RISK_SCORE')
     bottom_5 = product_df.nsmallest(5, 'RISK_SCORE')
-    
-    # Predict survival functions
+
+    # Compute survival functions: S(t|X) = S_0(t)^exp(X*beta)
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    
+
     # Plot 1: High risk customers
     ax1 = axes[0]
-    survival_high = model.predict_survival_function(top_5[feature_cols])
-    
-    for col in survival_high.columns[:5]:
-        survival_high[col].plot(ax=ax1, label=f"Customer {top_5.iloc[col]['CustomerID']:.0f}")
-    
+    top_5_hazards = model.predict_partial_hazard(top_5[feature_cols])
+    for i, (idx, row) in enumerate(top_5.iterrows()):
+        survival_curve = baseline_surv ** top_5_hazards.iloc[i]
+        ax1.plot(survival_curve.index, survival_curve.values, label=f"Customer {int(row['CustomerID'])}")
+
     ax1.set_title(f'Product {product_code}: HIGH RISK Customers\n(Most likely to repurchase)', fontsize=14, fontweight='bold')
     ax1.set_xlabel('Days Since Last Purchase', fontsize=12)
     ax1.set_ylabel('Survival Probability (No Repurchase)', fontsize=12)
     ax1.legend(title='Top 5 Risk Customers')
     ax1.grid(alpha=0.3)
-    
+
     # Plot 2: Low risk customers
     ax2 = axes[1]
-    survival_low = model.predict_survival_function(bottom_5[feature_cols])
-    
-    for col in survival_low.columns[:5]:
-        survival_low[col].plot(ax=ax2, label=f"Customer {bottom_5.iloc[col]['CustomerID']:.0f}")
-    
+    bottom_5_hazards = model.predict_partial_hazard(bottom_5[feature_cols])
+    for i, (idx, row) in enumerate(bottom_5.iterrows()):
+        survival_curve = baseline_surv ** bottom_5_hazards.iloc[i]
+        ax2.plot(survival_curve.index, survival_curve.values, label=f"Customer {int(row['CustomerID'])}")
+
     ax2.set_title(f'Product {product_code}: LOW RISK Customers\n(Least likely to repurchase)', fontsize=14, fontweight='bold')
     ax2.set_xlabel('Days Since Last Purchase', fontsize=12)
     ax2.set_ylabel('Survival Probability (No Repurchase)', fontsize=12)
     ax2.legend(title='Bottom 5 Risk Customers')
     ax2.grid(alpha=0.3)
-    
+
     plt.tight_layout()
-    plt.savefig(f'/mnt/user-data/outputs/survival_curves_product_{product_code}.png', dpi=150, bbox_inches='tight')
-    print(f"✅ Saved survival curves to /mnt/user-data/outputs/survival_curves_product_{product_code}.png")
-    
+    plt.savefig(f'survival_curves_product_{product_code}.png', dpi=150, bbox_inches='tight')
+    print(f"✅ Saved survival curves to survival_curves_product_{product_code}.png")
+
     return fig
 
 
@@ -596,8 +642,8 @@ def main():
     generate_business_insights(results_df, cph_stratified, feature_cols)
     
     # Save results
-    results_df.to_csv('/mnt/user-data/outputs/repurchase_predictions.csv', index=False)
-    print(f"\n✅ Results saved to /mnt/user-data/outputs/repurchase_predictions.csv")
+    results_df.to_csv('repurchase_predictions.csv', index=False)
+    print(f"\n✅ Results saved to repurchase_predictions.csv")
     
     return cph_stratified, results_df
 
